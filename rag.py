@@ -31,26 +31,11 @@ if not GEMINI_API_KEY:
 app = Flask(__name__)
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
-@app.before_request
-def handle_preflight():
-    if request.method == 'OPTIONS':
-        response = app.make_default_options_response()
-        response.headers['Access-Control-Allow-Origin'] = '*'
-        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
-        response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
-        response.headers['Access-Control-Allow-Private-Network'] = 'true'
-        return response
-
-@app.after_request
-def add_cors_headers(response):
-    response.headers['Access-Control-Allow-Origin'] = '*'
-    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
-    response.headers['Access-Control-Allow-Private-Network'] = 'true'
-    return response
+CORS(app, origins=["http://localhost:5000", "http://127.0.0.1:5000"], supports_credentials=True)
 
 # ── GLOBAL STATE (loaded in background) ───────────────────────────────────────
 embed_model    = None
+mongo_client   = None
 collection     = None
 doc_count      = 0
 gemini_client  = None
@@ -58,35 +43,38 @@ ACTIVE_GEMINI_MODEL = GEMINI_MODEL
 _ready         = False
 _startup_error = None
 
+    
+def init_resources():
+    global embed_model, mongo_client, collection, doc_count, gemini_client, ACTIVE_GEMINI_MODEL
+    if embed_model is not None:
+        return
+
+    print("\nInitializing resources (this may take a while)...")
+    print("Loading embedding model (multilingual-e5-large)...")
+    embed_model = SentenceTransformer("intfloat/multilingual-e5-large")
+    print("  Model ready.")
+
+    print("Connecting to MongoDB...")
+    mongo_client = MongoClient(MONGO_URI)
+    collection   = mongo_client[DB_NAME][COLLECTION]
+    doc_count    = collection.count_documents({})
+    print(f"  Connected — {doc_count} legal articles available.")
+
+    print("Initializing Gemini...")
+    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    ACTIVE_GEMINI_MODEL = GEMINI_MODEL
+    print(f"  Gemini ready ({ACTIVE_GEMINI_MODEL}).")
+
+    print(f"\nServer will listen on the port provided by the environment ($PORT={PORT})")
+    print("=" * 60)
 
 def _load_resources():
-    """Load heavy resources in a background thread so Flask can bind port first."""
-    global embed_model, collection, doc_count, gemini_client, _ready, _startup_error, ACTIVE_GEMINI_MODEL
-
+    global _ready, _startup_error
     try:
-        print("=" * 60)
-        print("Arabic Legal RAG — Flask Microservice (Multilingual)")
-        print("=" * 60)
-
-        print("\n[1/3] Loading embedding model (multilingual-e5-large)...")
-        embed_model = SentenceTransformer("intfloat/multilingual-e5-large")
-        print("  Model ready.")
-
-        print("[2/3] Connecting to MongoDB...")
-        mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)
-        collection   = mongo_client[DB_NAME][COLLECTION]
-        doc_count    = collection.count_documents({})
-        print(f"  Connected — {doc_count} legal articles available.")
-
-        print("[3/3] Initializing Gemini...")
-        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-        ACTIVE_GEMINI_MODEL = GEMINI_MODEL
-        print(f"  Gemini ready ({ACTIVE_GEMINI_MODEL}).")
-
+        init_resources()
         _ready = True
         print("\n✅ All resources loaded — service is ready.")
         print("=" * 60)
-
     except Exception as exc:
         _startup_error = str(exc)
         print(f"\n❌ Startup error: {exc}")
