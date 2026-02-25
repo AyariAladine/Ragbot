@@ -1,10 +1,11 @@
 import os
 import re
 import time
+import threading
 from flask_cors import CORS
 
 from dotenv import load_dotenv
-load_dotenv()  # must be before os.getenv calls
+load_dotenv()
 
 from google import genai
 from flask import Flask, request, jsonify
@@ -26,10 +27,10 @@ if not MONGO_URI:
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY is not set in .env")
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ── APP ───────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
-# ── CORS with Private Network Access support ─────────────────────────────────
+# ── CORS ──────────────────────────────────────────────────────────────────────
 @app.before_request
 def handle_preflight():
     if request.method == 'OPTIONS':
@@ -48,59 +49,82 @@ def add_cors_headers(response):
     response.headers['Access-Control-Allow-Private-Network'] = 'true'
     return response
 
-# ── STARTUP: load everything once at boot ─────────────────────────────────────
-
-print("=" * 60)
-print("Arabic Legal RAG — Flask Microservice (Multilingual)")
-print("=" * 60)
-
-print("\nLoading embedding model (multilingual-e5-large)...")
-embed_model = SentenceTransformer("intfloat/multilingual-e5-large")
-print("  Model ready.")
-
-print("Connecting to MongoDB...")
-mongo_client = MongoClient(MONGO_URI)
-collection   = mongo_client[DB_NAME][COLLECTION]
-doc_count    = collection.count_documents({})
-print(f"  Connected — {doc_count} legal articles available.")
-
-print("Initializing Gemini...")
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+# ── GLOBAL STATE (loaded in background) ───────────────────────────────────────
+embed_model    = None
+collection     = None
+doc_count      = 0
+gemini_client  = None
 ACTIVE_GEMINI_MODEL = GEMINI_MODEL
-print(f"  Gemini ready ({ACTIVE_GEMINI_MODEL}).")
+_ready         = False
+_startup_error = None
 
-print(f"\nServer running on http://localhost:{PORT}")
-print("=" * 60)
+
+def _load_resources():
+    """Load heavy resources in a background thread so Flask can bind port first."""
+    global embed_model, collection, doc_count, gemini_client, _ready, _startup_error, ACTIVE_GEMINI_MODEL
+
+    try:
+        print("=" * 60)
+        print("Arabic Legal RAG — Flask Microservice (Multilingual)")
+        print("=" * 60)
+
+        print("\n[1/3] Loading embedding model (multilingual-e5-large)...")
+        embed_model = SentenceTransformer("intfloat/multilingual-e5-large")
+        print("  Model ready.")
+
+        print("[2/3] Connecting to MongoDB...")
+        mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)
+        collection   = mongo_client[DB_NAME][COLLECTION]
+        doc_count    = collection.count_documents({})
+        print(f"  Connected — {doc_count} legal articles available.")
+
+        print("[3/3] Initializing Gemini...")
+        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+        ACTIVE_GEMINI_MODEL = GEMINI_MODEL
+        print(f"  Gemini ready ({ACTIVE_GEMINI_MODEL}).")
+
+        _ready = True
+        print("\n✅ All resources loaded — service is ready.")
+        print("=" * 60)
+
+    except Exception as exc:
+        _startup_error = str(exc)
+        print(f"\n❌ Startup error: {exc}")
+
+
+# Start loading in background immediately
+_loader_thread = threading.Thread(target=_load_resources, daemon=True)
+_loader_thread.start()
+
+
+def _require_ready():
+    """Return a 503 response if resources are still loading."""
+    if _startup_error:
+        return jsonify({"error": "Service failed to start", "details": _startup_error}), 503
+    if not _ready:
+        return jsonify({"error": "Service is still initializing, please retry in a few seconds"}), 503
+    return None
 
 
 # ── LANGUAGE DETECTION ────────────────────────────────────────────────────────
 
 def detect_language(text: str) -> str:
-    """
-    Detect whether the question is Arabic, French, or English.
-    Returns: 'arabic' | 'french' | 'english'
-    """
     arabic_chars = len(re.findall(r'[\u0600-\u06FF]', text))
     arabic_ratio = arabic_chars / max(len(text.strip()), 1)
-
     if arabic_ratio > 0.2:
         return 'arabic'
-
     french_words   = r'\b(le|la|les|de|du|des|est|sont|pour|avec|dans|sur|une|un|comment|quoi|quel|quelle|qui|que|quand|où|quelles|quels|puis-je|puis|pouvez|voulez)\b'
     french_accents = r'[àâäéèêëîïôùûüç]'
     french_score   = len(re.findall(french_words, text.lower())) + \
                      len(re.findall(french_accents, text.lower()))
-
     if french_score >= 1:
         return 'french'
-
     return 'english'
 
 
 # ── PROMPTS ───────────────────────────────────────────────────────────────────
 
 def build_context(articles: list) -> str:
-    """Build the legal context block shared across all prompts."""
     context = ""
     for i, r in enumerate(articles):
         context += (
@@ -114,16 +138,6 @@ def build_context(articles: list) -> str:
 
 
 def build_unified_prompt(question: str, articles: list, lang: str) -> str:
-    """
-    Single unified prompt that combines DB context (if any) with a web search
-    instruction. Gemini is asked to:
-      1. Use the retrieved DB articles as a primary grounding source.
-      2. Use its Google Search tool to complement / fill gaps.
-      3. Synthesise one coherent answer from both sources.
-
-    `articles` may be an empty list when no DB results exist — the prompt
-    degrades gracefully to web-search-only in that case.
-    """
     has_db_context = bool(articles)
     context        = build_context(articles) if has_db_context else ""
 
@@ -187,7 +201,7 @@ Règles de réponse :
 
 === Réponse juridique complète ==="""
 
-    else:  # english
+    else:
         db_section = f"""
 === Texts retrieved from the database ===
 {context}
@@ -219,7 +233,6 @@ Answer rules:
 
 
 def classify_gemini_error(error_text: str) -> str:
-    """Classify Gemini API errors for cleaner API responses."""
     text = error_text.lower()
     if "resource_exhausted" in text or "quota" in text or "429" in text:
         return "quota_exceeded"
@@ -235,9 +248,7 @@ def classify_gemini_error(error_text: str) -> str:
 
 
 def generate_with_gemini(prompt: str) -> tuple[str, str]:
-    """Generate content with configured model and graceful fallback if unavailable."""
     global ACTIVE_GEMINI_MODEL
-
     preferred_candidates = [
         ACTIVE_GEMINI_MODEL,
         "gemini-2.5-flash",
@@ -245,16 +256,13 @@ def generate_with_gemini(prompt: str) -> tuple[str, str]:
         "gemini-2.0-flash",
         "gemini-2.0-flash-lite",
     ]
-
     model_candidates = []
     seen_models = set()
     for model_name in preferred_candidates:
         if model_name and model_name not in seen_models:
             model_candidates.append(model_name)
             seen_models.add(model_name)
-
     errors = []
-
     for model_name in model_candidates:
         try:
             response = gemini_client.models.generate_content(
@@ -266,7 +274,6 @@ def generate_with_gemini(prompt: str) -> tuple[str, str]:
         except Exception as exc:
             errors.append(f"{model_name}: {exc}")
             continue
-
     raise RuntimeError(
         "Gemini generation failed for all model candidates. "
         + " | ".join(errors)
@@ -274,34 +281,22 @@ def generate_with_gemini(prompt: str) -> tuple[str, str]:
 
 
 def generate_with_gemini_search(prompt: str) -> tuple[str, str]:
-    """
-    Generate content using Gemini with Google Search grounding enabled.
-    Used for the fallback path when no relevant DB articles are found.
-    Tries search-capable models first, then falls back to standard generation.
-    """
     global ACTIVE_GEMINI_MODEL
-
-    # Models that support Google Search grounding
     search_candidates = [
         "gemini-2.5-flash",
         "gemini-2.0-flash",
         ACTIVE_GEMINI_MODEL,
     ]
-
     model_candidates = []
     seen_models = set()
     for model_name in search_candidates:
         if model_name and model_name not in seen_models:
             model_candidates.append(model_name)
             seen_models.add(model_name)
-
     errors = []
-
-    # ── Attempt 1: Gemini with Google Search grounding ────────────────────────
     for model_name in model_candidates:
         try:
             from google.genai import types as genai_types
-
             response = gemini_client.models.generate_content(
                 model=model_name,
                 contents=prompt,
@@ -310,22 +305,15 @@ def generate_with_gemini_search(prompt: str) -> tuple[str, str]:
                 ),
             )
             ACTIVE_GEMINI_MODEL = model_name
-
-            # Extract plain text; grounded responses may include citation metadata
-            text = response.text or ""
-            return (text, model_name)
-
+            return (response.text or "", model_name)
         except Exception as exc:
             errors.append(f"{model_name}+search: {exc}")
             continue
-
-    # ── Attempt 2: Plain generation without search (last resort) ─────────────
     try:
         plain_text, plain_model = generate_with_gemini(prompt)
         return (plain_text, plain_model)
     except Exception as exc:
         errors.append(f"plain_fallback: {exc}")
-
     raise RuntimeError(
         "Gemini search generation failed for all candidates. "
         + " | ".join(errors)
@@ -335,9 +323,7 @@ def generate_with_gemini_search(prompt: str) -> tuple[str, str]:
 # ── HELPERS ───────────────────────────────────────────────────────────────────
 
 def vector_search(query: str, top_k: int = TOP_K, law_num: int = None) -> list:
-    """Embed query and run MongoDB Atlas $vectorSearch."""
     embedding = embed_model.encode(query).tolist()
-
     vector_stage = {
         "index":         "embedding_index",
         "path":          "embedding",
@@ -345,10 +331,8 @@ def vector_search(query: str, top_k: int = TOP_K, law_num: int = None) -> list:
         "numCandidates": top_k * 10,
         "limit":         top_k,
     }
-
     if law_num is not None:
         vector_stage["filter"] = {"law_num": {"$eq": int(law_num)}}
-
     pipeline = [
         {"$vectorSearch": vector_stage},
         {
@@ -363,17 +347,18 @@ def vector_search(query: str, top_k: int = TOP_K, law_num: int = None) -> list:
             }
         },
     ]
-
     return list(collection.aggregate(pipeline))
-
-
 
 
 # ── ROUTES ────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
-    """Health check — call this from NestJS to verify the service is up."""
+    """Health check — always responds, even while loading."""
+    if _startup_error:
+        return jsonify({"status": "error", "details": _startup_error}), 503
+    if not _ready:
+        return jsonify({"status": "loading", "message": "Service is still initializing..."}), 200
     return jsonify({
         "status":           "ok",
         "model":            "intfloat/multilingual-e5-large",
@@ -388,11 +373,10 @@ def health():
 
 @app.post("/search")
 def search():
-    """
-    Vector search only — no Gemini. Useful for debugging.
+    not_ready = _require_ready()
+    if not_ready:
+        return not_ready
 
-    Body: { "question": "...", "topK": 5, "lawNum": null }
-    """
     body     = request.get_json() or {}
     question = (body.get("question") or "").strip()
     top_k    = int(body.get("topK", TOP_K))
@@ -417,33 +401,10 @@ def search():
 
 @app.post("/ask")
 def ask():
-    """
-    Full RAG pipeline — always combines DB context AND Gemini web search.
+    not_ready = _require_ready()
+    if not_ready:
+        return not_ready
 
-    Flow:
-      1. Detect language
-      2. Vector search MongoDB (all results returned regardless of score)
-      3. Build unified prompt with DB context (or empty section if none found)
-      4. Gemini generates answer using BOTH the DB context AND live web search
-         → one coherent answer synthesised from both sources
-
-    Body:
-      {
-        "question": "ما هي شروط الوعد بالجعل؟",
-        "topK":     5,   // optional, default from .env
-        "lawNum":   1    // optional, filter to a specific law (1–5)
-      }
-
-    Response:
-      {
-        "question":         "...",
-        "language":         "arabic",
-        "answer":           "وفقاً للفصل 20... (قاعدة البيانات) ... وبحسب ما وجدناه على الإنترنت...",
-        "answerSource":     "rag+web_search",
-        "sources":          [ { "chunk_id": "...", "article_num": 20, ... } ],
-        "processingTimeMs": 1243
-      }
-    """
     body     = request.get_json() or {}
     question = (body.get("question") or "").strip()
     top_k    = int(body.get("topK", TOP_K))
@@ -453,17 +414,10 @@ def ask():
         return jsonify({"error": "question is required"}), 400
 
     start = time.time()
-
-    # 1. Detect language
-    lang = detect_language(question)
-
-    # 2. Vector search MongoDB (best-effort; may return empty or low-score results)
+    lang  = detect_language(question)
     articles = vector_search(question, top_k, law_num)
+    prompt   = build_unified_prompt(question, articles, lang)
 
-    # 3. Build unified prompt (DB context + web search instruction)
-    prompt = build_unified_prompt(question, articles, lang)
-
-    # 4. Generate with Gemini + Google Search grounding
     try:
         answer, used_model = generate_with_gemini_search(prompt)
     except Exception as exc:
